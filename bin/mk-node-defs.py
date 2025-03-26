@@ -91,6 +91,8 @@ chpasswd:
     root:{root_password}
   expire: false
 ssh_pwauth: true
+packages:
+  - nfs-common
 write_files:
   - path: /etc/netplan/00-local.yaml
     content: |
