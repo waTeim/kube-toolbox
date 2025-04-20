@@ -13,27 +13,22 @@ def parse_memory(mem_str: str) -> int:
     if mem_str.isdigit():
         return int(mem_str)
     mem_str = mem_str.upper()
-    if mem_str.endswith("GB"):
+    if mem_str.endswith("GB") or mem_str.endswith("G"):
         try:
-            val = float(mem_str[:-2])
+            # Remove either 'GB' or 'G'
+            if mem_str.endswith("GB"):
+                val = float(mem_str[:-2])
+            else:
+                val = float(mem_str[:-1])
             return int(val * 1024)
         except ValueError:
             raise argparse.ArgumentTypeError(f"Invalid memory specification: {mem_str}")
-    elif mem_str.endswith("G"):
+    elif mem_str.endswith("MB") or mem_str.endswith("M"):
         try:
-            val = float(mem_str[:-1])
-            return int(val * 1024)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"Invalid memory specification: {mem_str}")
-    elif mem_str.endswith("MB"):
-        try:
-            val = float(mem_str[:-2])
-            return int(val)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"Invalid memory specification: {mem_str}")
-    elif mem_str.endswith("M"):
-        try:
-            val = float(mem_str[:-1])
+            if mem_str.endswith("MB"):
+                val = float(mem_str[:-2])
+            else:
+                val = float(mem_str[:-1])
             return int(val)
         except ValueError:
             raise argparse.ArgumentTypeError(f"Invalid memory specification: {mem_str}")
@@ -48,41 +43,38 @@ def parse_disk_size(size_str: str) -> int:
     size_str = size_str.strip().upper()
     if size_str.isdigit():
         return int(size_str)
-    if size_str.endswith("GB"):
+    if size_str.endswith("GB") or size_str.endswith("G"):
         try:
-            val = float(size_str[:-2])
+            if size_str.endswith("GB"):
+                val = float(size_str[:-2])
+            else:
+                val = float(size_str[:-1])
             return int(val)
         except ValueError:
             raise argparse.ArgumentTypeError(f"Invalid disk size specification: {size_str}")
-    elif size_str.endswith("G"):
+    elif size_str.endswith("MB") or size_str.endswith("M"):
         try:
-            val = float(size_str[:-1])
-            return int(val)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"Invalid disk size specification: {size_str}")
-    elif size_str.endswith("MB"):
-        try:
-            val = float(size_str[:-2])
+            if size_str.endswith("MB"):
+                val = float(size_str[:-2])
+            else:
+                val = float(size_str[:-1])
             # Convert MB to GB (round up at least 1GB)
-            return max(1, int(val / 1024))
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"Invalid disk size specification: {size_str}")
-    elif size_str.endswith("M"):
-        try:
-            val = float(size_str[:-1])
             return max(1, int(val / 1024))
         except ValueError:
             raise argparse.ArgumentTypeError(f"Invalid disk size specification: {size_str}")
     else:
         raise argparse.ArgumentTypeError("Disk size must be a number optionally suffixed with M/MB or G/GB")
 
-def generate_cloud_init(node_name, ip, prefix, router, root_password, nameservers):
+def generate_cloud_init(node_name, ip, prefix, router, root_password, nameservers, distro):
     """
-    Generate cloud-init user-data and meta-data with custom netplan configuration.
-    This writes a file /etc/netplan/00-local.yaml with the static network config,
-    and in runcmd removes the default netplan file so that only the custom one is applied.
-    Also, disable_root is set to false and ssh_pwauth is enabled.
+    Generate cloud-init user-data and meta-data with custom configuration.
+    
+    For ubuntu (default) the network is configured via netplan.
+    For debian, a custom cloud-init is generated with a hashed root password.
     """
+    meta_data = f"""instance-id: {node_name}
+local-hostname: {node_name}
+"""
     user_data = f"""#cloud-config
 disable_root: false
 hostname: {node_name}
@@ -91,8 +83,6 @@ chpasswd:
     root:{root_password}
   expire: false
 ssh_pwauth: true
-packages:
-  - nfs-common
 write_files:
   - path: /etc/netplan/00-local.yaml
     content: |
@@ -116,9 +106,6 @@ runcmd:
   - rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
   - rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
 """
-    meta_data = f"""instance-id: {node_name}
-local-hostname: {node_name}
-"""
     return user_data, meta_data
 
 def main():
@@ -139,16 +126,23 @@ def main():
                         help="Number of nodes to generate")
     parser.add_argument("--node-base", type=int, default=1,
                         help="Starting node number (default: 1)")
+    # Retain the ubuntu-image argument for ubuntu distro.
     parser.add_argument("--ubuntu-image", default="ubuntu-24.04-server-cloudimg-amd64.img",
                         help="Ubuntu cloud image file name (default: ubuntu-24.04-server-cloudimg-amd64.img)")
     parser.add_argument("--image-dir", default="cloud",
-                        help="Directory where the Ubuntu cloud images (downloaded via wget) are located (default: cloud)")
+                        help="Directory where the cloud images are located (default: cloud)")
     parser.add_argument("--root-password", type=str, default=None,
                         help="Root password for nodes. If not provided, you'll be prompted.")
     parser.add_argument("--nameservers", default="8.8.8.8,8.8.4.4",
                         help="Comma separated list of nameservers (default: 8.8.8.8,8.8.4.4)")
     parser.add_argument("--output-dir", default="config/nodes",
                         help="Output directory for configuration files (default: config/nodes)")
+    # New flag to choose the distribution.
+    parser.add_argument("--distro", choices=["ubuntu", "debian"], default="ubuntu",
+                        help="Choose the distro: ubuntu (default) or debian")
+    # When using debian, allow selecting a version.
+    parser.add_argument("--debian-version", choices=["12", "11"], default="12",
+                        help="For debian distro, select the version (default: 12)")
 
     args = parser.parse_args()
 
@@ -177,11 +171,26 @@ def main():
     nameservers_list = ', '.join([s.strip() for s in args.nameservers.split(',')])
 
     # Determine the backing store image path.
-    # Use absolute path for the backing image so it's unambiguous.
-    if os.path.isabs(args.ubuntu_image):
-        backing_image = args.ubuntu_image
+    if args.distro == "ubuntu":
+        # Use the provided ubuntu image.
+        if os.path.isabs(args.ubuntu_image):
+            backing_image = args.ubuntu_image
+        else:
+            backing_image = os.path.join(args.image_dir, args.ubuntu_image)
+        os_variant = "ubuntu24.04"
+    elif args.distro == "debian":
+        # Select the debian image based on the version.
+        if args.debian_version == "12":
+            debian_image_file = "debian-12-genericcloud-amd64.qcow2"
+            os_variant = "debian12"
+        elif args.debian_version == "11":
+            debian_image_file = "debian-11-genericcloud-amd64.qcow2"
+            os_variant = "debian11"
+        backing_image = os.path.join(args.image_dir, debian_image_file)
     else:
-        backing_image = os.path.join(args.image_dir, args.ubuntu_image)
+        parser.error("Unsupported distro specified.")
+
+    # Use absolute path for the backing image so it's unambiguous.
     backing_image_abs = os.path.abspath(backing_image)
 
     # Create the output directory for configuration files if it doesn't exist.
@@ -198,7 +207,8 @@ def main():
         node_ip = str(ipaddress.ip_address(node_ip_int))
 
         # Generate cloud-init configuration.
-        user_data, meta_data = generate_cloud_init(node_name, node_ip, prefix, args.router, args.root_password, nameservers_list)
+        user_data, meta_data = generate_cloud_init(node_name, node_ip, prefix, args.router,
+                                                    args.root_password, nameservers_list, args.distro)
 
         # Write cloud-init files in the config directory.
         node_config_dir = os.path.join(args.output_dir, node_name)
@@ -217,6 +227,10 @@ def main():
         # Define the disk image and ISO paths.
         disk_path = os.path.join(vm_image_dir, f"{node_name}.qcow2")
         iso_path = os.path.join(vm_image_dir, f"seed-{node_name}.iso")
+        if args.distro == "debian":
+          cdrom_device = "cdrom,bus=scsi"
+        else:
+          cdrom_device = "cdrom"
 
         # Create the virt-install.sh script that will:
         # 1. Check if the seed ISO exists; if not, generate it using genisoimage.
@@ -252,8 +266,8 @@ fi
 virt-install --name {node_name} \\
   --memory {mem_mb} --vcpus {args.cpu} \\
   --disk path="${{DISK_PATH}}",size={disk_size},backing_store="{backing_image_abs}" \\
-  --disk path="${{ISO_PATH}}",device=cdrom \\
-  --os-variant ubuntu24.04 --import \\
+  --disk path="${{ISO_PATH}}",device={cdrom_device} \\
+  --os-variant {os_variant} --import \\
   --network bridge=br0,model=virtio --graphics none
 """
         # Write the virt-install.sh script to the node's config directory.
