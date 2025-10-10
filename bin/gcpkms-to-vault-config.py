@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, shutil, subprocess, sys, tempfile
+import argparse, json, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 def need(bin_name):
@@ -54,26 +54,33 @@ def resolve_project_id(identifier: str) -> str:
 
 def exists_keyring(project, location, keyring):
     return subprocess.run(["gcloud","kms","keyrings","describe",keyring,"--location",location,f"--project={project}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True).returncode==0
+
 def exists_key(project, location, keyring, keyname):
     return subprocess.run(["gcloud","kms","keys","describe",keyname,"--location",location,"--keyring",keyring,f"--project={project}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True).returncode==0
+
 def exists_sa(project, sa_email):
     return subprocess.run(["gcloud","iam","service-accounts","describe",sa_email,f"--project={project}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True).returncode==0
 
 def ensure_keyring(project, location, keyring):
     if not exists_keyring(project, location, keyring):
         run(["gcloud","kms","keyrings","create",keyring,"--location",location,f"--project={project}"], capture=True)
+
 def ensure_key(project, location, keyring, keyname):
     if not exists_key(project, location, keyring, keyname):
         run(["gcloud","kms","keys","create",keyname,"--location",location,"--keyring",keyring,"--purpose","encryption",f"--project={project}"], capture=True)
+
 def ensure_sa(project, sa_email, sa_name):
     if not exists_sa(project, sa_email):
         run(["gcloud","iam","service-accounts","create",sa_name,"--display-name","Vault auto-unseal",f"--project={project}"], capture=True)
-def ensure_kms_binding(project, location, keyring, keyname, sa_email):
-    pol = run(["gcloud","kms","keys","get-iam-policy",keyname,"--location",location,"--keyring",keyring,f"--project={project}","--format=json"], capture=True)
-    j = json.loads(pol.stdout or "{}")
-    already = any(b.get("role")=="roles/cloudkms.cryptoKeyEncrypterDecrypter" and f"serviceAccount:{sa_email}" in set(b.get("members",[])) for b in j.get("bindings",[]))
-    if not already:
-        run(["gcloud","kms","keys","add-iam-policy-binding",keyname,"--location",location,"--keyring",keyring,f"--project={project}","--member",f"serviceAccount:{sa_email}","--role","roles/cloudkms.cryptoKeyEncrypterDecrypter"], capture=True)
+
+def ensure_kms_bindings(project, location, keyring, keyname, sa_email):
+    # Ensure BOTH roles: EncrypterDecrypter and Viewer (Vault needs GetCryptoKey)
+    for role in ["roles/cloudkms.cryptoKeyEncrypterDecrypter","roles/cloudkms.viewer"]:
+        pol = run(["gcloud","kms","keys","get-iam-policy",keyname,"--location",location,"--keyring",keyring,f"--project={project}","--format=json"], capture=True)
+        j = json.loads(pol.stdout or "{}")
+        have = any(b.get("role")==role and f"serviceAccount:{sa_email}" in set(b.get("members",[])) for b in j.get("bindings",[]))
+        if not have:
+            run(["gcloud","kms","keys","add-iam-policy-binding",keyname,"--location",location,"--keyring",keyring,f"--project={project}","--member",f"serviceAccount:{sa_email}","--role",role], capture=True)
 
 def current_namespace_from_kubeconfig():
     try:
@@ -109,7 +116,7 @@ def to_yaml(d):
 
 def main():
     need("gcloud")
-    ap = argparse.ArgumentParser(description="Ensure GCP KMS + SA (idempotent), optional K8s Secret, and emit minimal config YAML (gcp + k8s).")
+    ap = argparse.ArgumentParser(description="Ensure GCP KMS + SA (idempotent), grant KMS roles, optional K8s Secret, and emit minimal config YAML (gcp + k8s).")
     ap.add_argument("--project", required=True, help="GCP project (ID or display name)")
     ap.add_argument("--location", default="global", help="KMS location (global or region)")
     ap.add_argument("--keyring", default="vault-unseal-ring", help="KMS key ring")
@@ -135,11 +142,9 @@ def main():
     ensure_key(project_id, args.location, args.keyring, args.keyname)
     sa_email = f"{args.sa_name}@{project_id}.iam.gserviceaccount.com"
     ensure_sa(project_id, sa_email, args.sa_name)
-    ensure_kms_binding(project_id, args.location, args.keyring, args.keyname, sa_email)
+    ensure_kms_bindings(project_id, args.location, args.keyring, args.keyname, sa_email)
 
     ns = args.namespace or current_namespace_from_kubeconfig()
-
-    # Compose the *actual* in-pod path the chart will use (secret mounts under a subdir named after the secret)
     creds_file_in_pod = f"{args.mount_path}/{args.secret_name}/{args.secret_file_name}"
 
     if args.create_k8s_secret:
@@ -159,7 +164,6 @@ def main():
         create_or_replace_secret(core, ns, args.secret_name, {args.secret_file_name: sa_json})
         print(f"Created/updated Secret '{args.secret_name}' in namespace '{ns}' with file '{args.secret_file_name}'", file=sys.stderr)
 
-    # Minimal config (renderer will add ingress/replicas)
     config_obj = {
         "gcp": {"project": project_id, "location": args.location, "keyring": args.keyring, "keyname": args.keyname},
         "k8s": {"namespace": ns, "secretName": args.secret_name, "mountPath": args.mount_path, "credsFile": creds_file_in_pod}
