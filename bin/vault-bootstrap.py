@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+
 import argparse, json, sys, time
+import json, ast
 from kubernetes import client, config
+from kubernetes.client import V1DeleteOptions
 from kubernetes.stream import stream
 
 def k8s():
@@ -40,30 +43,63 @@ def kexec(core, ns, pod, cmd, container="vault", env=None):
     print(out.strip())
     return out
 
+
+def parse_any_json(text: str):
+    # First try strict JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Fallback: accept Python-style dicts (single quotes, True/False/None)
+    try:
+        obj = ast.literal_eval(text)
+        return obj
+    except Exception as e:
+        raise SystemExit(f"[error] could not parse output as JSON or Python-literal:\n{text}\n{e}")
+
 def vault_status(core, ns, pod):
     out = kexec(core, ns, pod, "vault status -format=json")
-    try:
-        j = json.loads(out)
-    except Exception:
-        j = {}
-    print(f"[status:{pod}] initialized={j.get('initialized')} sealed={j.get('sealed')} standby={j.get('standby')}")
-    return j
+    data = parse_any_json(out)
+    print(f"[status:{pod}] initialized={data.get('initialized')} sealed={data.get('sealed')} standby={data.get('standby')}")
+    return data
 
 def vault_init(core, ns, pod):
     # Auto-seal (gcpckms) => use recovery_* only
     out = kexec(core, ns, pod, "vault operator init -recovery-shares=1 -recovery-threshold=1 -format=json")
-    try:
-        j = json.loads(out)
-    except Exception as e:
-        raise SystemExit(f"[error] init did not return JSON\n{out}\n{e}")
+    data = parse_any_json(out)
     print("[init] JSON:")
-    print(json.dumps(j, indent=2))
-    return j
+    print(json.dumps(data, indent=2))   # re-emit as proper JSON
+    return data
 
 def raft_join(core, ns, pod, leader_addr, token=None):
     env = {"VAULT_ADDR": leader_addr}
     if token: env["VAULT_TOKEN"] = token
     kexec(core, ns, pod, f"vault operator raft join {leader_addr}", env=env)
+
+def follower_env_sanity(core, ns, pod):
+    out = kexec(core, ns, pod, 'echo $GOOGLE_APPLICATION_CREDENTIALS; ls -l $GOOGLE_APPLICATION_CREDENTIALS || true')
+    print(f"[env:{pod}] {out.strip()}")
+
+def restart_pod(core, ns, pod):
+    print(f"[restart] deleting {pod} to trigger auto-unseal via KMS …")
+    core.delete_namespaced_pod(name=pod, namespace=ns, body=V1DeleteOptions(grace_period_seconds=0))
+    # Wait for it to disappear then reappear running
+    # (simple wait loop; reuse your wait_container_running)
+    time.sleep(3)
+    # Wait until pod name is back (statefulset keeps same name)
+    start=time.time()
+    while time.time()-start < 300:
+        try:
+            p = core.read_namespaced_pod(pod, ns); _=p
+            if p.status.phase in ("Running","Succeeded"):
+                cs = p.status.container_statuses or []
+                if cs and all((c.state.running is not None) for c in cs):
+                    print(f"[restart] {pod} back and running")
+                    return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise SystemExit(f"[timeout] follower {pod} did not come back running")
 
 def main():
     ap = argparse.ArgumentParser("Vault bootstrap via kubectl exec (no readiness requirement).")
@@ -100,10 +136,19 @@ def main():
     for p in pods:
         if p == leader_pod: continue
         wait_container_running(core, args.namespace, p)
+        follower_env_sanity(core, args.namespace, p)
         try:
             raft_join(core, args.namespace, p, leader_addr, token=args.root_token)
         except Exception as e:
             print(f"[warn] join failed for {p}: {e}")
+
+        # poll status; restart if still sealed/uninitialized
+        time.sleep(2)
+        st = vault_status(core, args.namespace, p)
+        if not st.get("initialized") or st.get("sealed"):
+            restart_pod(core, args.namespace, p)
+            time.sleep(2)
+            st = vault_status(core, args.namespace, p)
 
     # Final statuses
     for p in pods:
