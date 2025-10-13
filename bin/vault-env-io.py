@@ -32,7 +32,7 @@ Examples:
 
 import argparse, json, os, sys, urllib.request, urllib.error, subprocess
 
-def vault_request(addr, token, method, path, data=None):
+def vault_request(addr, token, method, path, data=None, *, allow_404=False):
     url = addr.rstrip("/") + "/v1/" + path.lstrip("/")
     req = urllib.request.Request(url, method=method)
     req.add_header("X-Vault-Token", token)
@@ -45,6 +45,8 @@ def vault_request(addr, token, method, path, data=None):
             raw = resp.read()
             return json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as e:
+        if allow_404 and e.code == 404:
+            return {"_missing": True}
         msg = e.read().decode("utf-8", errors="ignore")
         raise SystemExit(f"[ERROR] {method} {url} -> HTTP {e.code}: {msg}")
     except urllib.error.URLError as e:
@@ -146,17 +148,21 @@ def cmd_push(addr, token, mount, user_id, file_path):
     version = resp.get("data", {}).get("version")
     print(f"[OK] Wrote env at {mount}/{user_id} (version={version})")
 
-def cmd_pull(addr, token, mount, user_id, out_path):
-    resp = vault_request(addr, token, "GET", f"{mount}/data/{user_id}")
+def cmd_pull(addr, token, mount, user_id, out_path, create_if_missing=False):
+    resp = vault_request(addr, token, "GET", f"{mount}/data/{user_id}", allow_404=create_if_missing)
+    if resp.get("_missing"):
+        out = {"data": {}}
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, sort_keys=True); f.write("\n")
+        print(f"[OK] Secret missing; wrote empty skeleton to {out_path}")
+        return
     doc = resp.get("data", {}).get("data", {})
     out = {"data": doc}
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2, sort_keys=True)
-            f.write("\n")
-    except Exception as e:
-        raise SystemExit(f"[FATAL] Failed to write {out_path}: {e}")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, sort_keys=True); f.write("\n")
     print(f"[OK] Wrote {out_path} from {mount}/{user_id}")
+
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -171,7 +177,8 @@ def main():
     sp_push.add_argument("--file", required=True, help="Path to JSON file in the shape {'data': {...}}")
 
     sp_pull = sub.add_parser("pull", help="Pull JSON from KV v2")
-    sp_pull.add_argument("--out", required=True, help="Path to write JSON (same shape {'data': {...}})")
+    sp_pull.add_argument("--out", required=True, help="Path to write JSON")
+    sp_pull.add_argument("--create-if-missing", action="store_true",help="If secret does not exist, write an empty skeleton instead of failing")
 
     args = p.parse_args()
 
@@ -191,7 +198,8 @@ def main():
     if args.cmd == "push":
         cmd_push(addr, token, mount_data_prefix, user_id, getattr(args, "file"))
     elif args.cmd == "pull":
-        cmd_pull(addr, token, mount_data_prefix, user_id, getattr(args, "out"))
+        cmd_pull(addr, token, mount_data_prefix, user_id, getattr(args, "out"),
+                create_if_missing=getattr(args, "create_if_missing"))
 
 if __name__ == "__main__":
     main()
