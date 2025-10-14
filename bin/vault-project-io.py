@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-vault_env_push_pull.py
+projects_io.py
 ──────────────────────
 Store/retrieve MULTIPLE files in KV v2 at <mount>/data/<user>/<project>, each base64-encoded
 with per-file metadata, under a single secret per project.
+
+Mount default: projects/
 
 Commands:
   push <FILE...>        Store one or more files (merge by filename; overwrite on name collision)
@@ -218,7 +220,6 @@ def cmd_pull(addr, token, mount, user_id, project, out_dir, namespace=None):
         total += 1
     print(f"[OK] Restored {total} file(s) to {os.path.abspath(out_dir or '.')}")
 
-
 def cmd_list_projects(addr, token, mount, user_id, namespace=None):
     mp = mount.strip("/")
     safe_user = quote(user_id, safe="")
@@ -315,7 +316,7 @@ def main():
     p.add_argument("--namespace", default=os.getenv("VAULT_NAMESPACE"), help="Vault namespace (Enterprise)")
     p.add_argument("--vault-token", default=None, help="Explicit Vault token (overrides all other sources)")
     p.add_argument("--login-oidc", action="store_true", help="Force OIDC login via `vault login -method=oidc`")
-    p.add_argument("--mount-path", default="env", help="KV v2 mount path (no trailing slash)")
+    p.add_argument("--mount-path", default="projects", help="KV v2 mount path (no trailing slash)")
     p.add_argument("--id", default=None, help="User/record id (defaults to OIDC username from token)")
     p.add_argument("--project", default="default", help="Project key under your namespace")
 
@@ -326,7 +327,7 @@ def main():
     sp_pull = sub.add_parser("pull", help="Pull all stored files, writing to their original filenames")
     sp_pull.add_argument("--dir", default=".", help="Directory to write files into (default: current dir)")
 
-    sub.add_parser("list-projects", help="List project names under your namespace")
+    sub.add_parser("list-projects", help="List project names under your alias")
 
     sp_del = sub.add_parser("delete", help="Delete a project (purge by default)")
     g = sp_del.add_mutually_exclusive_group()

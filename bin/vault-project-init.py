@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-vault_env_init.py
-Initialize a KV v2 mount for per-user, per-project env vars and install an alias-aware policy.
+vault_projects_init.py
+Initialize a KV v2 mount for per-user, per-project files and install an alias-aware policy.
 
 What it does:
-- Ensures a KV v2 secrets engine exists at --mount-path (default: env)
-- Writes/updates an ACL policy (default: env-io) that allows a user to RW only:
-    env/<OIDC-alias>            (optional base doc)
-    env/<OIDC-alias>/*          (per-project docs, e.g., env/<alias>/projectA)
+- Ensures a KV v2 secrets engine exists at --mount-path (default: projects)
+- Writes/updates an ACL policy (default: projects-io) that allows a user to RW only:
+    projects/<OIDC-alias>            (optional base doc)
+    projects/<OIDC-alias>/*          (per-project docs, e.g., projects/<alias>/projectA)
   using: {{identity.entity.aliases.<OIDC_ACCESSOR>.name}}
-- Optionally adds that policy to an existing OIDC role (token_policies += env-io)
+- Optionally adds that policy to an existing OIDC role (token_policies += projects-io)
 
 Auth:
-  - Uses VAULT_ADDR and VAULT_TOKEN by default; can be overridden via flags.
+  - Uses --vault-token (or $VAULT_TOKEN) with sufficient privileges.
 
 Examples:
-  ./vault_env_init.py
-  ./vault_env_init.py --mount-path env --policy-name env-io --oidc-role devs
-  ./vault_env_init.py --oidc-path auth/oidc
-  ./vault_env_init.py --oidc-accessor auth_oidc_ABC123
+  ./vault_projects_init.py
+  ./vault_projects_init.py --mount-path projects --policy-name projects-io --oidc-role devs
+  ./vault_projects_init.py --oidc-path auth/oidc
+  ./vault_projects_init.py --oidc-accessor auth_oidc_ABC123
 """
 
-import argparse, json, sys, urllib.request, urllib.error
+import argparse, json, os, sys, urllib.request, urllib.error
 
 def vault_request(addr, token, method, path, data=None):
     url = addr.rstrip("/") + "/v1/" + path.lstrip("/")
@@ -46,7 +46,8 @@ def ensure_kv_v2(addr, token, mount_path):
     key = mount_path.strip("/") + "/"
     if key in mounts:
         typ = mounts[key].get("type"); version = mounts[key].get("options", {}).get("version", "1")
-        if typ != "kv" or version != "2": raise SystemExit(f"[ERROR] Secrets engine at '{mount_path}/' exists but is not kv v2 (type={typ}, version={version}).")
+        if typ != "kv" or version != "2":
+            raise SystemExit(f"[ERROR] Secrets engine at '{mount_path}/' exists but is not kv v2 (type={typ}, version={version}).")
         print(f"[OK] KV v2 already mounted at {mount_path}/"); return
     payload = {"type": "kv", "options": {"version": "2"}}
     mount_target = f"sys/mounts/{mount_path.strip('/')}"
@@ -73,12 +74,20 @@ def write_policy(addr, token, policy_name, mount_path, oidc_accessor):
 # Authorizes: {mp}/<alias> and {mp}/<alias>/* where <alias> is the OIDC alias name for accessor {oidc_accessor}
 
 # Base key (optional single-doc)
-path "{mp}/data/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}" {{ capabilities = ["create","read","update","delete"] }}
-path "{mp}/metadata/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}" {{ capabilities = ["read","list","update","delete"] }}
+path "{mp}/data/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}" {{
+  capabilities = ["create","read","update","delete"]
+}}
+path "{mp}/metadata/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}" {{
+  capabilities = ["read","list","update","delete"]
+}}
 
 # Per-project keys
-path "{mp}/data/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}/*" {{ capabilities = ["create","read","update","delete"] }}
-path "{mp}/metadata/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}/*" {{ capabilities = ["read","list","update","delete"] }}
+path "{mp}/data/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}/*" {{
+  capabilities = ["create","read","update","delete"]
+}}
+path "{mp}/metadata/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}/*" {{
+  capabilities = ["read","list","update","delete"]
+}}
 
 # KV v2 version operations (base + subpaths)
 path "{mp}/delete/{{{{identity.entity.aliases.{oidc_accessor}.name}}}}"     {{ capabilities = ["update"] }}
@@ -103,12 +112,11 @@ def maybe_attach_policy_to_oidc_role(addr, token, oidc_path, role, policy_name):
     print(f"[OK] Added policy '{policy_name}' to OIDC role '{role}'")
 
 def main():
-    import os
     p = argparse.ArgumentParser()
     p.add_argument("--vault-addr", default=os.getenv("VAULT_ADDR", "http://127.0.0.1:8200"))
     p.add_argument("--vault-token", default=os.getenv("VAULT_TOKEN"))
-    p.add_argument("--mount-path", default="env", help="KV v2 mount path (no trailing slash)")
-    p.add_argument("--policy-name", default="env-io")
+    p.add_argument("--mount-path", default="projects", help="KV v2 mount path (no trailing slash)")
+    p.add_argument("--policy-name", default="projects-io")
     p.add_argument("--oidc-path", default="auth/oidc", help="Auth mount path for OIDC (as shown by 'vault auth list')")
     p.add_argument("--oidc-accessor", default=None, help="Override OIDC accessor (e.g., 'auth_oidc_ABC123')")
     p.add_argument("--oidc-role", default=None, help="Existing OIDC role to update (optional)")
