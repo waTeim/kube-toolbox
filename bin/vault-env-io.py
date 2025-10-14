@@ -2,11 +2,12 @@
 """
 vault_env_push_pull.py
 ──────────────────────
-Store/retrieve ANY file in KV v2 at <mount>/data/<user>/<project>, with metadata.
+Store/retrieve MULTIPLE files in KV v2 at <mount>/data/<user>/<project>, each base64-encoded
+with per-file metadata, under a single secret per project.
 
 Commands:
-  push <FILE>           Store a file as base64 blob + metadata (key 'blob')
-  pull [--dir DIR]      Restore the stored file to its original filename
+  push <FILE...>        Store one or more files (merge by filename; overwrite on name collision)
+  pull [--dir DIR]      Restore all stored files to DIR (default: .)
   list-projects         List child keys (projects) under your alias
   delete [mode]         Delete a project (purge/soft/destroy)
   undelete [--versions] Undelete soft-deleted versions (default: current_version)
@@ -20,6 +21,13 @@ Auth resolution order:
 Notes:
 - All HTTP calls include X-Vault-Namespace if --namespace is set.
 - OIDC CLI login is executed with VAULT_ADDR/VAULT_NAMESPACE set from flags.
+- Project secret shape (KV v2 "data"):
+    {
+      "files": {
+        "config.yaml": { "filename": "config.yaml", "encoding": "base64", "size_bytes": 123, "sha256": "...", "mime": "text/yaml", "bytes": "..." },
+        "server.crt":  { ... }
+      }
+    }
 """
 
 import argparse, base64, hashlib, json, mimetypes, os, sys, subprocess, urllib.error, urllib.request
@@ -85,23 +93,18 @@ def run_vault_login_oidc(addr, namespace=None):
         raise SystemExit(f"[FATAL] Could not parse login JSON: {e}\nOutput was:\n{proc.stdout}")
 
 def resolve_token(cli_token: str | None, *, force_oidc: bool, addr: str, namespace: str | None):
-    # 1) explicit flag wins
     if cli_token:
         return cli_token
-    # 2) optionally force OIDC login
     if force_oidc:
         print("[INFO] Forcing OIDC login via `vault login -method=oidc`...", file=sys.stderr)
         return run_vault_login_oidc(addr, namespace)
-    # 3) env vars
     for envvar in ("AUTH", "VAULT_TOKEN"):
         t = os.getenv(envvar)
         if t:
             return t
-    # 4) ~/.vault-token
     t = read_token_from_file(os.path.expanduser("~/.vault-token"))
     if t:
         return t
-    # 5) fallback to OIDC
     print("[INFO] No token via flag/ENV/file; invoking `vault login -method=oidc`...", file=sys.stderr)
     return run_vault_login_oidc(addr, namespace)
 
@@ -162,33 +165,59 @@ def _record_to_file(rec: dict, out_dir: str | None = None):
         f.write(data)
     return out_path, len(data)
 
-# ------------------------------- Commands -------------------------------
+# ------------------------------- Data helpers (multi-file) -------------------------------
 
-def cmd_push(addr, token, mount, user_id, project, file_path, namespace=None, warn_threshold=900_000):
-    if not os.path.isfile(file_path):
-        raise SystemExit(f"[FATAL] Not a file: {file_path}")
-    rec = _file_to_record(file_path)
-    if rec["size_bytes"] > warn_threshold:
-        print(f"[WARN] File is {rec['size_bytes']} bytes. KV v2 is for small secrets; consider object storage for larger blobs.", file=sys.stderr)
-    payload = {"data": {"blob": rec}}
-    path = kv_path(mount, user_id, project, kind="data")
-    resp = vault_request(addr, token, "POST", path, data=payload, namespace=namespace)
-    ver = resp.get("data", {}).get("version")
-    print(f"[OK] Stored '{rec['filename']}' ({rec['size_bytes']} bytes, sha256={rec['sha256'][:12]}…) at {mount.strip('/')}/{user_id}/{project or ''} (version={ver})")
-
-def cmd_pull(addr, token, mount, user_id, project, out_dir, namespace=None):
+def _read_project(addr, token, mount, user_id, project, *, namespace=None):
+    """Return (missing, files_map, raw_resp)"""
     path = kv_path(mount, user_id, project, kind="data")
     resp = vault_request(addr, token, "GET", path, allow_404=True, namespace=namespace)
     if resp.get("_missing"):
+        return True, {}, {}
+    data = resp.get("data", {}) or {}
+    files = data.get("data", {}).get("files", {})
+    if not isinstance(files, dict):
+        files = {}
+    return False, files, resp
+
+def _write_project(addr, token, mount, user_id, project, files_map: dict, *, namespace=None):
+    path = kv_path(mount, user_id, project, kind="data")
+    payload = {"data": {"files": files_map}}
+    return vault_request(addr, token, "POST", path, data=payload, namespace=namespace)
+
+# ------------------------------- Commands -------------------------------
+
+def cmd_push(addr, token, mount, user_id, project, file_paths, namespace=None, warn_threshold=900_000):
+    if not file_paths:
+        raise SystemExit("[FATAL] push requires at least one FILE.")
+    missing, current_files, _ = _read_project(addr, token, mount, user_id, project, namespace=namespace)
+
+    added = []
+    for p in file_paths:
+        if not os.path.isfile(p):
+            raise SystemExit(f"[FATAL] Not a file: {p}")
+        rec = _file_to_record(p)
+        if rec["size_bytes"] > warn_threshold:
+            print(f"[WARN] {rec['filename']}: {rec['size_bytes']} bytes. KV v2 is for small secrets.", file=sys.stderr)
+        current_files[rec["filename"]] = rec
+        added.append(rec["filename"])
+
+    resp = _write_project(addr, token, mount, user_id, project, current_files, namespace=namespace)
+    ver = resp.get("data", {}).get("version")
+    status = "created" if missing else "updated"
+    print(f"[OK] {status} project '{project}' with {len(added)} file(s): {', '.join(added)} (version={ver})")
+
+def cmd_pull(addr, token, mount, user_id, project, out_dir, namespace=None):
+    missing, files_map, _ = _read_project(addr, token, mount, user_id, project, namespace=namespace)
+    if missing or not files_map:
         print("[INFO] Nothing stored for this project yet.")
         return
-    doc = resp.get("data", {}).get("data", {})
-    blob = doc.get("blob")
-    if not blob:
-        print("[INFO] No file blob found at this path.")
-        return
-    out_path, size = _record_to_file(blob, out_dir)
-    print(f"[OK] Wrote {size} bytes to {out_path}")
+    total = 0
+    for name, rec in files_map.items():
+        out_path, size = _record_to_file(rec, out_dir)
+        print(f"[OK] Wrote {size} bytes to {out_path}")
+        total += 1
+    print(f"[OK] Restored {total} file(s) to {os.path.abspath(out_dir or '.')}")
+
 
 def cmd_list_projects(addr, token, mount, user_id, namespace=None):
     mp = mount.strip("/")
@@ -217,7 +246,6 @@ def cmd_delete(addr, token, mount, user_id, project, *, soft=False, destroy=Fals
     if soft and destroy:
         raise SystemExit("[FATAL] Choose either --soft or --destroy, not both.")
 
-    # Determine versions if needed
     if soft or destroy:
         cur, _ = _get_current_version(addr, token, mount, user_id, project, namespace=namespace)
         if versions is None or versions == []:
@@ -292,11 +320,11 @@ def main():
     p.add_argument("--project", default="default", help="Project key under your namespace")
 
     # subcommands
-    sp_push = sub.add_parser("push", help="Push a file to KV v2 (stored as base64 blob + metadata)")
-    sp_push.add_argument("file", help="Path to the file to store")
+    sp_push = sub.add_parser("push", help="Push one or more files to KV v2 (merge by filename)")
+    sp_push.add_argument("files", nargs="+", help="Path(s) to file(s) to store")
 
-    sp_pull = sub.add_parser("pull", help="Pull the stored file, writing to its original filename")
-    sp_pull.add_argument("--dir", default=".", help="Directory to write the file into (default: current dir)")
+    sp_pull = sub.add_parser("pull", help="Pull all stored files, writing to their original filenames")
+    sp_pull.add_argument("--dir", default=".", help="Directory to write files into (default: current dir)")
 
     sub.add_parser("list-projects", help="List project names under your namespace")
 
@@ -327,7 +355,7 @@ def main():
         raise SystemExit("[FATAL] Could not determine --id from token; pass --id explicitly (e.g., --id jeff).")
 
     if args.cmd == "push":
-        cmd_push(addr, token, mount, user_id, args.project, getattr(args, "file"), namespace=namespace)
+        cmd_push(addr, token, mount, user_id, args.project, getattr(args, "files"), namespace=namespace)
     elif args.cmd == "pull":
         cmd_pull(addr, token, mount, user_id, args.project, out_dir=getattr(args, "dir"), namespace=namespace)
     elif args.cmd == "list-projects":
