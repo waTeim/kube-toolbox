@@ -14,7 +14,7 @@ Usage:
   ./vault-group-add.py GROUP --vault-addr https://vault.wat.im --vault-token $(cat root-token.txt) [--role devs] [--groups-claim https://wat.im/groups]
 """
 
-import argparse, json, urllib.request, urllib.error
+import sys,argparse, json, urllib.request, urllib.error
 
 def vr(addr, token, method, path, data=None):
     url = addr.rstrip("/") + "/v1/" + path.lstrip("/")
@@ -64,29 +64,82 @@ path "{mp}/destroy/{group}/*"    {{ capabilities = ["update"] }}
     print(f"[OK] Upserted policy '{name}'")
     return name
 
-def ensure_identity_group(addr, token, group):
-    # Try by-name (Vault >= 1.20)
+def ensure_group_alias(addr, token, group_name, group_id, oidc_accessor):
+    """
+    Ensure an Identity Group alias named `group_name` exists for the given OIDC mount.
+    - Reads the group to inspect existing aliases (supports both 'aliases' array and 'alias' object).
+    - Creates the alias if missing.
+    - Updates the alias name if it exists on the mount but the name differs.
+    """
+    # Read current group (to see aliases) — tolerate both shapes
+    grp = vr(addr, token, "GET", f"identity/group/id/{group_id}").get("data", {}) or {}
+    aliases = grp.get("aliases") or []
+    if not aliases and isinstance(grp.get("alias"), dict) and grp["alias"]:
+        aliases = [grp["alias"]]
+
+    # Find alias for this specific auth mount
+    match = next((a for a in aliases if a.get("mount_accessor") == oidc_accessor), None)
+
+    if match is None:
+        # No alias for this mount → create one
+        payload = {"name": group_name, "mount_accessor": oidc_accessor, "canonical_id": group_id}
+        vr(addr, token, "POST", "identity/group-alias", data=payload)
+        print(f"[OK] Created Group Alias: {group_name} -> {oidc_accessor}")
+        return
+
+    # Alias exists on this mount; ensure the name matches
+    alias_id = match.get("id")
+    current_name = match.get("name")
+    if current_name == group_name:
+        print(f"[OK] Group Alias already correct for mount {oidc_accessor}: {current_name}")
+        return
+
+    # Update alias name (keeps same canonical_id + mount)
+    vr(addr, token, "POST", f"identity/group-alias/id/{alias_id}", data={"name": group_name})
+    print(f"[OK] Updated Group Alias name: {current_name} -> {group_name}")
+
+def ensure_identity_group_external(addr, token, group_name, policy_name=None):
+    """
+    Ensure an Identity Group named `group_name` exists with type='external'.
+    If an internal group exists, delete and recreate as external. Optionally attach a policy.
+    Returns the group_id.
+    """
+    gid, gtype = None, None
     try:
-        got = vr(addr, token, "GET", f"identity/group/name/{group}")
-        gid = (got.get("data") or {}).get("id")
-        if gid:
-            print(f"[OK] Identity Group exists: {group} ({gid})")
-            return gid
+        got = vr(addr, token, "GET", f"identity/group/name/{group_name}")
+        d = (got.get("data") or {})
+        gid, gtype = d.get("id"), d.get("type")
     except SystemExit:
         pass
-    res = vr(addr, token, "POST", "identity/group", data={"name": group})
-    gid = (res.get("data") or {}).get("id")
-    if not gid: raise SystemExit("[FATAL] Could not create Identity Group.")
-    print(f"[OK] Created Identity Group: {group} ({gid})")
-    return gid
 
-def ensure_group_alias(addr, token, group, group_id, oidc_accessor):
-    payload = {"name": group, "mount_accessor": oidc_accessor, "canonical_id": group_id}
-    try:
-        vr(addr, token, "POST", "identity/group-alias", data=payload)
-        print(f"[OK] Created Group Alias: {group} -> {oidc_accessor}")
-    except SystemExit:
-        print(f"[INFO] Group Alias may already exist for '{group}' (continuing).")
+    if gid and gtype == "external":
+        # Optionally ensure policy is attached
+        if policy_name:
+            cur = vr(addr, token, "GET", f"identity/group/id/{gid}").get("data", {}) or {}
+            pols = set(cur.get("policies") or [])
+            if policy_name not in pols:
+                pols.add(policy_name)
+                vr(addr, token, "POST", f"identity/group/id/{gid}", data={"policies": sorted(pols)})
+                print(f"[OK] Attached policy '{policy_name}' to Identity Group '{group_name}'")
+        print(f"[OK] Identity Group exists (external): {group_name} ({gid})")
+        return gid
+
+    if gid and gtype != "external":
+        # Recreate as external
+        vr(addr, token, "DELETE", f"identity/group/id/{gid}")
+        print(f"[INFO] Recreated '{group_name}' as external (was {gtype}).")
+
+    # Create external group
+    data = {"name": group_name, "type": "external"}
+    if policy_name:
+        data["policies"] = [policy_name]
+    res = vr(addr, token, "POST", "identity/group", data=data)
+    new_gid = (res.get("data") or {}).get("id")
+    if not new_gid:
+        raise SystemExit("[FATAL] Could not create external Identity Group.")
+    print(f"[OK] Created external Identity Group: {group_name} ({new_gid})")
+    return new_gid
+
 
 def attach_policy(addr, token, group_id, policy_name):
     cur = vr(addr, token, "GET", f"identity/group/id/{group_id}").get("data", {})
@@ -118,10 +171,10 @@ def main():
 
     addr, token, group = args.vault_addr, args.vault_token, args.GROUP
     accessor = get_oidc_accessor(addr, token, args.oidc_path)
-    pol = upsert_group_policy(addr, token, group, mount=args.mount_path)
-    gid = ensure_identity_group(addr, token, group)
-    ensure_group_alias(addr, token, group, gid, accessor)
-    attach_policy(addr, token, gid, pol)
+    policy_name = upsert_group_policy(addr, token, group, mount=args.mount_path)
+    group_id = ensure_identity_group_external(addr, token, group, policy_name=policy_name)
+    ensure_group_alias(addr, token, group, group_id, accessor)
+    attach_policy(addr, token, group_id, policy_name)
     maybe_set_groups_claim(addr, token, args.oidc_path, args.role, args.groups_claim)
     print("[DONE] Group namespace ready. Users re-login; Vault will map token groups to this group.")
 

@@ -28,8 +28,9 @@ Auth resolution order:
   3) ~/.vault-token
   4) `vault login -method=oidc`  (if --login-oidc or as last resort)
 
-User id:
-  Derived from token via auth/token/lookup-self (meta.username/user, else display_name "oidc-<alias>").
+Owner:
+  By default derived from your token (personal alias).
+  Use -g/--group to target a shared group.
 """
 
 import argparse, base64, hashlib, json, mimetypes, os, sys, subprocess, urllib.error, urllib.request
@@ -118,16 +119,16 @@ def discover_id(addr, token):
         return dn[5:]
     raise SystemExit("[FATAL] Could not derive user id from token (no meta.username/user and display_name not oidc-*).")
 
-def kv_path(mount: str, user_id: str, project: str | None, *, kind: str):
+def kv_path(mount: str, owner: str, project: str | None, *, kind: str):
     """
     kind ∈ { data, metadata, delete, undelete, destroy }
     """
     mp = mount.strip("/")
-    safe_user = quote(user_id, safe="")
+    safe_owner = quote(owner, safe="")
     safe_proj = quote(project, safe="") if project is not None else ""
     if kind not in ("data", "metadata", "delete", "undelete", "destroy"):
         raise ValueError("kind must be data|metadata|delete|undelete|destroy")
-    return f"{mp}/{kind}/{safe_user}/{safe_proj}" if safe_proj else f"{mp}/{kind}/{safe_user}"
+    return f"{mp}/{kind}/{safe_owner}/{safe_proj}" if safe_proj else f"{mp}/{kind}/{safe_owner}"
 
 # ------------------------------- Blob helpers -------------------------------
 
@@ -169,8 +170,8 @@ def _record_to_file(rec: dict, out_dir: str | None = None):
 
 # ------------------------------- Project data helpers -------------------------------
 
-def _read_project(addr, token, mount, user_id, project):
-    path = kv_path(mount, user_id, project, kind="data")
+def _read_project(addr, token, mount, owner, project):
+    path = kv_path(mount, owner, project, kind="data")
     resp = vault_request(addr, token, "GET", path, allow_404=True)
     if resp.get("_missing"):
         return True, {}, {}
@@ -180,13 +181,13 @@ def _read_project(addr, token, mount, user_id, project):
         files = {}
     return False, files, resp
 
-def _write_project(addr, token, mount, user_id, project, files_map: dict):
-    path = kv_path(mount, user_id, project, kind="data")
+def _write_project(addr, token, mount, owner, project, files_map: dict):
+    path = kv_path(mount, owner, project, kind="data")
     payload = {"data": {"files": files_map}}
     return vault_request(addr, token, "POST", path, data=payload)
 
-def _get_current_version(addr, token, mount, user_id, project):
-    meta_path = kv_path(mount, user_id, project, kind="metadata")
+def _get_current_version(addr, token, mount, owner, project):
+    meta_path = kv_path(mount, owner, project, kind="metadata")
     resp = vault_request(addr, token, "GET", meta_path, allow_404=True)
     if resp.get("_missing"):
         return None, {}
@@ -195,10 +196,10 @@ def _get_current_version(addr, token, mount, user_id, project):
 
 # ------------------------------- Commands -------------------------------
 
-def cmd_push(addr, token, mount, user_id, project, file_paths, warn_threshold=900_000):
+def cmd_push(addr, token, mount, owner, project, file_paths, warn_threshold=900_000):
     if not file_paths:
         raise SystemExit("[FATAL] push requires at least one FILE.")
-    missing, current_files, _ = _read_project(addr, token, mount, user_id, project)
+    missing, current_files, _ = _read_project(addr, token, mount, owner, project)
 
     added = []
     for p in file_paths:
@@ -210,13 +211,13 @@ def cmd_push(addr, token, mount, user_id, project, file_paths, warn_threshold=90
         current_files[rec["filename"]] = rec
         added.append(rec["filename"])
 
-    resp = _write_project(addr, token, mount, user_id, project, current_files)
+    resp = _write_project(addr, token, mount, owner, project, current_files)
     ver = resp.get("data", {}).get("version")
     status = "created" if missing else "updated"
     print(f"[OK] {status} project '{project}' with {len(added)} file(s): {', '.join(added)} (version={ver})")
 
-def cmd_pull(addr, token, mount, user_id, project, out_dir):
-    missing, files_map, _ = _read_project(addr, token, mount, user_id, project)
+def cmd_pull(addr, token, mount, owner, project, out_dir):
+    missing, files_map, _ = _read_project(addr, token, mount, owner, project)
     if missing or not files_map:
         print("[INFO] Nothing stored for this project yet.")
         return
@@ -227,10 +228,10 @@ def cmd_pull(addr, token, mount, user_id, project, out_dir):
         total += 1
     print(f"[OK] Restored {total} file(s) to {os.path.abspath(out_dir or '.')}")
 
-def cmd_list_projects(addr, token, mount, user_id):
+def cmd_list_projects(addr, token, mount, owner):
     mp = mount.strip("/")
-    safe_user = quote(user_id, safe="")
-    resp = vault_request(addr, token, "LIST", f"{mp}/metadata/{safe_user}", allow_404=True)
+    safe_owner = quote(owner, safe="")
+    resp = vault_request(addr, token, "LIST", f"{mp}/metadata/{safe_owner}", allow_404=True)
     if resp.get("_missing"):
         print("(no projects)")
         return
@@ -242,12 +243,12 @@ def cmd_list_projects(addr, token, mount, user_id):
     for k in cleaned:
         print(k)
 
-def cmd_delete(addr, token, mount, user_id, project, *, soft=False, destroy=False, versions=None, force=False):
+def cmd_delete(addr, token, mount, owner, project, *, soft=False, destroy=False, versions=None, force=False):
     if soft and destroy:
         raise SystemExit("[FATAL] Choose either --soft or --destroy, not both.")
 
     if soft or destroy:
-        cur, _ = _get_current_version(addr, token, mount, user_id, project)
+        cur, _ = _get_current_version(addr, token, mount, owner, project)
         if versions is None or versions == []:
             if soft:
                 versions = [cur] if cur else []
@@ -263,7 +264,7 @@ def cmd_delete(addr, token, mount, user_id, project, *, soft=False, destroy=Fals
         if not (soft or destroy)
         else ("soft-delete versions " + ",".join(map(str, versions)) if soft else "DESTROY versions " + ",".join(map(str, versions)))
     )
-    target = f"{mount.strip('/')}/{user_id}/{project or ''}"
+    target = f"{mount.strip('/')}/{owner}/{project or ''}"
     if not force:
         ans = input(f"About to {action} at {target}. Proceed? [y/N] ").strip().lower()
         if ans not in ("y", "yes"):
@@ -271,20 +272,20 @@ def cmd_delete(addr, token, mount, user_id, project, *, soft=False, destroy=Fals
             return
 
     if soft:
-        path = kv_path(mount, user_id, project, kind="delete")
+        path = kv_path(mount, owner, project, kind="delete")
         vault_request(addr, token, "POST", path, data={"versions": versions})
         print(f"[OK] Soft-deleted versions {versions} at {target}.")
     elif destroy:
-        path = kv_path(mount, user_id, project, kind="destroy")
+        path = kv_path(mount, owner, project, kind="destroy")
         vault_request(addr, token, "POST", path, data={"versions": versions})
         print(f"[OK] Permanently destroyed versions {versions} at {target}.")
     else:
-        meta_path = kv_path(mount, user_id, project, kind="metadata")
+        meta_path = kv_path(mount, owner, project, kind="metadata")
         vault_request(addr, token, "DELETE", meta_path, data=None)
         print(f"[OK] Purged project '{project}' (all versions + metadata removed) at {target}.")
 
-def cmd_undelete(addr, token, mount, user_id, project, versions=None, force=False):
-    cur, _ = _get_current_version(addr, token, mount, user_id, project)
+def cmd_undelete(addr, token, mount, owner, project, versions=None, force=False):
+    cur, _ = _get_current_version(addr, token, mount, owner, project)
     if versions is None or versions == []:
         if not cur:
             print("[INFO] No versions found to undelete.")
@@ -294,20 +295,20 @@ def cmd_undelete(addr, token, mount, user_id, project, versions=None, force=Fals
         versions = [int(v) for v in versions]
     except Exception:
         raise SystemExit("[FATAL] versions must be integers.")
-    target = f"{mount.strip('/')}/{user_id}/{project or ''}"
+    target = f"{mount.strip('/')}/{owner}/{project or ''}"
     if not force:
         ans = input(f"About to UNDELETE versions {versions} at {target}. Proceed? [y/N] ").strip().lower()
         if ans not in ("y", "yes"):
             print("[INFO] Aborted.")
             return
-    path = kv_path(mount, user_id, project, kind="undelete")
+    path = kv_path(mount, owner, project, kind="undelete")
     vault_request(addr, token, "POST", path, data={"versions": versions})
     print(f"[OK] Undeleted versions {versions} at {target}.")
 
 # -------- per-file commands --------
 
-def cmd_ls(addr, token, mount, user_id, project):
-    missing, files_map, _ = _read_project(addr, token, mount, user_id, project)
+def cmd_ls(addr, token, mount, owner, project):
+    missing, files_map, _ = _read_project(addr, token, mount, owner, project)
     if missing:
         print("(project not found)")
         return
@@ -317,8 +318,8 @@ def cmd_ls(addr, token, mount, user_id, project):
     for name in sorted(files_map.keys()):
         print(name)
 
-def cmd_cat(addr, token, mount, user_id, project, name):
-    missing, files_map, _ = _read_project(addr, token, mount, user_id, project)
+def cmd_cat(addr, token, mount, owner, project, name):
+    missing, files_map, _ = _read_project(addr, token, mount, owner, project)
     if missing or name not in files_map:
         raise SystemExit(f"[FATAL] File '{name}' not found in project '{project}'.")
     rec = files_map[name]
@@ -329,10 +330,10 @@ def cmd_cat(addr, token, mount, user_id, project, name):
         b64 = base64.b64encode(data).decode("ascii")
         print(f"[INFO] '{name}' is not valid UTF-8; printing base64 below:\n{b64}")
 
-def cmd_rm(addr, token, mount, user_id, project, names):
+def cmd_rm(addr, token, mount, owner, project, names):
     if not names:
         raise SystemExit("[FATAL] rm requires at least one NAME.")
-    missing, files_map, _ = _read_project(addr, token, mount, user_id, project)
+    missing, files_map, _ = _read_project(addr, token, mount, owner, project)
     if missing:
         raise SystemExit(f"[FATAL] Project '{project}' does not exist.")
     removed = []
@@ -345,14 +346,14 @@ def cmd_rm(addr, token, mount, user_id, project, names):
     if not removed:
         print("[INFO] Nothing to remove.")
         return
-    _write_project(addr, token, mount, user_id, project, files_map)
+    _write_project(addr, token, mount, owner, project, files_map)
     print(f"[OK] Removed {len(removed)} file(s): {', '.join(removed)}")
 
-def cmd_mv(addr, token, mount, user_id, project, old, new):
+def cmd_mv(addr, token, mount, owner, project, old, new):
     if old == new:
         print("[INFO] mv: old and new names are the same; nothing to do.")
         return
-    missing, files_map, _ = _read_project(addr, token, mount, user_id, project)
+    missing, files_map, _ = _read_project(addr, token, mount, owner, project)
     if missing or old not in files_map:
         raise SystemExit(f"[FATAL] File '{old}' not found in project '{project}'.")
     if new in files_map:
@@ -360,7 +361,7 @@ def cmd_mv(addr, token, mount, user_id, project, old, new):
     rec = files_map.pop(old)
     rec["filename"] = new
     files_map[new] = rec
-    _write_project(addr, token, mount, user_id, project, files_map)
+    _write_project(addr, token, mount, owner, project, files_map)
     print(f"[OK] Renamed '{old}' -> '{new}'")
 
 # ------------------------------- CLI -------------------------------
@@ -374,7 +375,8 @@ def main():
     p.add_argument("--vault-token", default=None, help="Explicit Vault token (overrides all other sources)")
     p.add_argument("--login-oidc", action="store_true", help="Force OIDC login via `vault login -method=oidc`")
     p.add_argument("--mount-path", default="projects", help="KV v2 mount path (no trailing slash)")
-    p.add_argument("--project", default="default", help="Project key under your namespace")
+    p.add_argument("--project", default="default", help="Project key under the selected owner (user or group)")
+    p.add_argument("-g", "--group", dest="group", default=None, help="Operate in a shared group (e.g., 'g0'). If omitted, uses your personal alias from the token.")
 
     # bulk file
     sp_push = sub.add_parser("push", help="Push one or more files to KV v2 (merge by filename)")
@@ -383,7 +385,7 @@ def main():
     sp_pull = sub.add_parser("pull", help="Pull all stored files, writing to their original filenames")
     sp_pull.add_argument("--dir", default=".", help="Directory to write files into (default: current dir)")
 
-    sub.add_parser("list-projects", help="List project names under your alias (metadata LIST)")
+    sub.add_parser("list-projects", help="List the owner's project names")
 
     sp_del = sub.add_parser("delete", help="Delete a project (purge by default)")
     g = sp_del.add_mutually_exclusive_group()
@@ -412,33 +414,34 @@ def main():
     mount = args.mount_path.strip("/")
 
     # derive user id from token (no --id)
-    user_id = discover_id(addr, token)
+    owner = args.group or discover_id(addr, token)
 
     if args.cmd == "push":
-        cmd_push(addr, token, mount, user_id, args.project, getattr(args, "files"))
+        cmd_push(addr, token, mount, owner, args.project, getattr(args, "files"))
     elif args.cmd == "pull":
-        cmd_pull(addr, token, mount, user_id, args.project, out_dir=getattr(args, "dir"))
+        cmd_pull(addr, token, mount, owner, args.project, out_dir=getattr(args, "dir"))
     elif args.cmd == "list-projects":
-        cmd_list_projects(addr, token, mount, user_id)
+        cmd_list_projects(addr, token, mount, owner)
     elif args.cmd == "delete":
         versions_list = None
         if getattr(args, "versions", None):
             versions_list = [v.strip() for v in args.versions.split(",") if v.strip()]
-        cmd_delete(addr, token, mount, user_id, args.project,
+        cmd_delete(addr, token, mount, owner, args.project,
                    soft=args.soft, destroy=args.destroy, versions=versions_list, force=args.force)
     elif args.cmd == "undelete":
         versions_list = None
         if getattr(args, "versions", None):
             versions_list = [v.strip() for v in args.versions.split(",") if v.strip()]
-        cmd_undelete(addr, token, mount, user_id, args.project, versions=versions_list, force=args.force)
+        cmd_undelete(addr, token, mount, owner, args.project, versions=versions_list, force=args.force)
     elif args.cmd == "ls":
-        cmd_ls(addr, token, mount, user_id, args.project)
+        cmd_ls(addr, token, mount, owner, args.project)
     elif args.cmd == "cat":
-        cmd_cat(addr, token, mount, user_id, args.project, args.name)
+        cmd_cat(addr, token, mount, owner, args.project, args.name)
     elif args.cmd == "rm":
-        cmd_rm(addr, token, mount, user_id, args.project, args.names)
+        cmd_rm(addr, token, mount, owner, args.project, args.names)
     elif args.cmd == "mv":
-        cmd_mv(addr, token, mount, user_id, args.project, args.old, args.new)
+        cmd_mv(addr, token, mount, owner, args.project, args.old, args.new)
 
 if __name__ == "__main__":
     main()
+   
