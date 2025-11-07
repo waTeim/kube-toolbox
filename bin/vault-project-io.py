@@ -31,6 +31,10 @@ Auth resolution order:
 Owner:
   By default derived from your token (personal alias).
   Use -g/--group to target a shared group.
+
+Paths:
+  Stored filenames are the file paths relative to the current working directory.
+  Subdirectories are preserved (e.g., "cfg/app.yaml"). Absolute paths and ".." are rejected.
 """
 
 import argparse, base64, hashlib, json, mimetypes, os, sys, subprocess, urllib.error, urllib.request
@@ -132,15 +136,14 @@ def kv_path(mount: str, owner: str, project: str | None, *, kind: str):
 
 # ------------------------------- Blob helpers -------------------------------
 
-def _file_to_record(path_fs: str):
+def _file_to_record(path_fs: str, stored_name: str):
     with open(path_fs, "rb") as f:
         raw = f.read()
     b64 = base64.b64encode(raw).decode("ascii")
     sha = hashlib.sha256(raw).hexdigest()
-    name = os.path.basename(path_fs)
-    mime, _ = mimetypes.guess_type(name)
+    mime, _ = mimetypes.guess_type(stored_name)
     return {
-        "filename": name,
+        "filename": stored_name,             # may include subdirs like "cfg/app.yaml"
         "encoding": "base64",
         "size_bytes": len(raw),
         "sha256": sha,
@@ -160,13 +163,20 @@ def _record_to_bytes(rec: dict) -> bytes:
 
 def _record_to_file(rec: dict, out_dir: str | None = None):
     data = _record_to_bytes(rec)
-    fname = rec.get("filename") or "blob.bin"
+    fname = rec.get("filename") or "blob.bin"  # can contain "a/b/c.txt"
     tgt_dir = os.path.abspath(out_dir or ".")
-    os.makedirs(tgt_dir, exist_ok=True)
     out_path = os.path.join(tgt_dir, fname)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(data)
     return out_path, len(data)
+
+def _safe_relname(name: str) -> str:
+    # normalize and forbid absolute/parent escapes
+    n = os.path.normpath(name).replace("\\", "/")
+    if os.path.isabs(name) or n == ".." or n.startswith("../"):
+        raise SystemExit(f"[FATAL] Unsafe path '{name}'")
+    return n
 
 # ------------------------------- Project data helpers -------------------------------
 
@@ -201,11 +211,15 @@ def cmd_push(addr, token, mount, owner, project, file_paths, warn_threshold=900_
         raise SystemExit("[FATAL] push requires at least one FILE.")
     missing, current_files, _ = _read_project(addr, token, mount, owner, project)
 
+    cwd = os.getcwd()
     added = []
     for p in file_paths:
         if not os.path.isfile(p):
             raise SystemExit(f"[FATAL] Not a file: {p}")
-        rec = _file_to_record(p)
+        abs_path = os.path.abspath(p)
+        rel = os.path.relpath(abs_path, cwd)
+        stored = _safe_relname(rel)
+        rec = _file_to_record(abs_path, stored)
         if rec["size_bytes"] > warn_threshold:
             print(f"[WARN] {rec['filename']}: {rec['size_bytes']} bytes. KV v2 is for small secrets.", file=sys.stderr)
         current_files[rec["filename"]] = rec
@@ -215,6 +229,7 @@ def cmd_push(addr, token, mount, owner, project, file_paths, warn_threshold=900_
     ver = resp.get("data", {}).get("version")
     status = "created" if missing else "updated"
     print(f"[OK] {status} project '{project}' with {len(added)} file(s): {', '.join(added)} (version={ver})")
+
 
 def cmd_pull(addr, token, mount, owner, project, out_dir):
     missing, files_map, _ = _read_project(addr, token, mount, owner, project)
